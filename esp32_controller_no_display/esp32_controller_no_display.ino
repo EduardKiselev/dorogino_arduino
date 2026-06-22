@@ -5,7 +5,7 @@
 #include <esp_wifi.h>
 
 // === НАСТРОЙКИ ===
-#define CONTROLLER_ID 1  // ← Уникальный ID устройства (1-255)
+#define CONTROLLER_ID 10  // ← Уникальный ID устройства (1-255)
 const char* ssid = "ELTEX-8478";
 const char* pass = "eSm-kp7-VdF-PtA";
 
