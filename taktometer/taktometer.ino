@@ -40,7 +40,7 @@ String sessionPUID;
 void sendHeartbeat() {
   // Собираем метрики: RSSI (сила сигнала), Heap (свободная память), Uptime
   String json = "{"
-                "\"type\":"\"taktometer\"",
+                "\"type\":\"taktometer\","
                 "\"sensor_id\":" + String(TAKTOMETER) + ","
                 "\"health\":{"
                   "\"rssi\":" + String(WiFi.RSSI()) + ","
