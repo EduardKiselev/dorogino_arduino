@@ -21,6 +21,9 @@ const float MAX_DIST = 110.0;
 const unsigned long CHECK_INTERVAL = 1 * 1000; 
 unsigned long lastCheck = 0;
 
+const unsigned long HEARTBEAT_INTERVAL = 60 * 1000; // 60 секунд
+unsigned long lastHeartbeat = 0;
+
 // --- Состояния ---
 enum State { EMPTY, NOT_EMPTY };
 State currentState = EMPTY;
@@ -33,6 +36,32 @@ uint8_t bufIndex = 0;
 
 volatile float lastDistanceCm = -1.0; 
 String sessionPUID;           
+
+void sendHeartbeat() {
+  // Собираем метрики: RSSI (сила сигнала), Heap (свободная память), Uptime
+  String json = "{"
+                "\"type\":"\"taktometer\"",
+                "\"sensor_id\":" + String(TAKTOMETER) + ","
+                "\"health\":{"
+                  "\"rssi\":" + String(WiFi.RSSI()) + ","
+                  "\"heap\":" + String(ESP.getFreeHeap()) + ","
+                  "\"uptime\":" + String(millis()) +
+                "}"
+                "}";
+
+  for (int i = 0; i < serverCount; i++) {
+    // Отправляем на отдельный эндпоинт
+    String url = "http://" + String(servers[i]) + ":" + String(serverPort) + "/heartbeat";
+    HTTPClient http;
+    http.begin(url);
+    http.addHeader("Content-Type", "application/json");
+    
+    int httpCode = http.POST(json);
+    Serial.print("Heartbeat sent to "); Serial.print(servers[i]);
+    Serial.print(" | Code: "); Serial.println(httpCode);
+    http.end();
+  }
+}
 
 void parseRadarData() {
   while (Serial1.available()) {
@@ -137,6 +166,11 @@ void loop() {
     }
 
     currentState = newState;
+  }
+
+    if (millis() - lastHeartbeat >= HEARTBEAT_INTERVAL) {
+    sendHeartbeat();
+    lastHeartbeat = millis();
   }
 }
 
