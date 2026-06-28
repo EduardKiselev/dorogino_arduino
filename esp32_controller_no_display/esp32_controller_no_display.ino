@@ -61,7 +61,7 @@ void setup() {
 
   // === 1. Устанавливаем MAC ДО подключения ===
   WiFi.mode(WIFI_STA);              // Обязательно перед esp_wifi_set_mac
-  setCustomMAC(CONTROLLER_ID);
+  setCustomMAC(CONTROLLER_ID + 200);
 
   // === 2. Задаём понятное имя хоста ===
   char hostname[32];
