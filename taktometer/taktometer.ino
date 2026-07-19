@@ -1,200 +1,226 @@
-#include <WiFi.h>
-#include <HTTPClient.h>
+// Совместимо с Arduino Uno R4 WiFi (Renesas RA4M1 + ESP32-S3)
+// Библиотека WiFiS3 позволяет Renesas управлять ESP32
 
-// --- Настройки Wi-Fi и серверов ---
+#include <WiFiS3.h> 
+
+// ================= НАСТРОЙКИ ПОЛЬЗОВАТЕЛЯ =================
+#define DEPTHMETER 1 
 const char* ssid = "ELTEX-8478";
 const char* password = "eSm-kp7-VdF-PtA";
 
-const int TAKTOMETER = 1;  
-
 const char* servers[] = {"192.168.1.100", "192.168.1.101"};
-const int serverCount = 2;
+const int SERVER_COUNT = 2;
 const int serverPort = 5000;
+const char* endpoint = "/depth";
+const int SAMPLES_PER_INTERVAL = 30;
+const float PERCENTILE_FACTOR = 0.8f; 
 
-const float MIN_DIST = 25.0;  
-const float MAX_DIST = 110.0; 
+// Пины Renesas (D2, D3 безопасны и не заняты)
+const int trigPin = 4; 
+const int echoPin = 5;
 
-#define RADAR_RX_PIN 18
-#define RADAR_TX_PIN 5
+const unsigned long MEASURE_INTERVAL = 1000; 
+const int MAX_READINGS = 6;
 
+const float MIN_DISTANCE = 10;
+const float MAX_DISTANCE = 2000.0;
+// ==========================================================
 
-const unsigned long CHECK_INTERVAL = 1 * 1000; 
-unsigned long lastCheck = 0;
+unsigned long previousMillis = 0;
+float readings[MAX_READINGS] = {0};
+int readingIndex = 0;
+int validReadingsCount = 0;
+String sessionPUID = ""; 
 
-const unsigned long HEARTBEAT_INTERVAL = 60 * 1000; // 60 секунд
-unsigned long lastHeartbeat = 0;
-
-// --- Состояния ---
-enum State { EMPTY, NOT_EMPTY };
-State currentState = EMPTY;
-int taktCount = 0;
-
-// --- UART и парсинг ---
-#define BUFFER_SIZE 20
-uint8_t uartBuffer[BUFFER_SIZE];
-uint8_t bufIndex = 0;
-
-volatile float lastDistanceCm = -1.0; 
-String sessionPUID;           
-
-void sendHeartbeat() {
-  // Собираем метрики: RSSI (сила сигнала), Heap (свободная память), Uptime
-  String json = "{"
-                "\"type\":\"taktometer\","
-                "\"sensor_id\":" + String(TAKTOMETER) + ","
-                "\"health\":{"
-                  "\"rssi\":" + String(WiFi.RSSI()) + ","
-                  "\"heap\":" + String(ESP.getFreeHeap()) + ","
-                  "\"uptime\":" + String(millis()) +
-                "}"
-                "}";
-
-  for (int i = 0; i < serverCount; i++) {
-    // Отправляем на отдельный эндпоинт
-    String url = "http://" + String(servers[i]) + ":" + String(serverPort) + "/heartbeat";
-    HTTPClient http;
-    http.begin(url);
-    http.addHeader("Content-Type", "application/json");
-    
-    int httpCode = http.POST(json);
-    Serial.print("Heartbeat sent to "); Serial.print(servers[i]);
-    Serial.print(" | Code: "); Serial.println(httpCode);
-    http.end();
-  }
-}
-
-void parseRadarData() {
-  while (Serial1.available()) {
-    uint8_t c = Serial1.read();
-    
-    if (bufIndex == 0) {
-      if (c == 0xF4) uartBuffer[bufIndex++] = c;
-    } 
-    else if (bufIndex == 1) {
-      if (c == 0xF3) uartBuffer[bufIndex++] = c;
-      else bufIndex = (c == 0xF4) ? 1 : 0;
-    } 
-    else if (bufIndex == 2) {
-      if (c == 0xF2) uartBuffer[bufIndex++] = c;
-      else bufIndex = (c == 0xF4) ? 1 : 0;
-    } 
-    else if (bufIndex == 3) {
-      if (c == 0xF1) uartBuffer[bufIndex++] = c;
-      else bufIndex = (c == 0xF4) ? 1 : 0;
-    } 
-    else {
-      if (bufIndex < BUFFER_SIZE) {
-        uartBuffer[bufIndex++] = c;
-      } else {
-        bufIndex = 0; 
-        continue;
-      }
-      
-      if (bufIndex == 14) {
-        if (uartBuffer[4] == 0x04 && uartBuffer[5] == 0x00 &&
-            uartBuffer[10] == 0xF8 && uartBuffer[11] == 0xF7 && 
-            uartBuffer[12] == 0xF6 && uartBuffer[13] == 0xF5) {
-          
-          uint32_t floatBits = uartBuffer[6] | (uartBuffer[7] << 8) | 
-                               (uartBuffer[8] << 16) | (uartBuffer[9] << 24);
-          float distanceMm;
-          memcpy(&distanceMm, &floatBits, sizeof(float));
-          
-          lastDistanceCm = distanceMm / 10.0;
-
-        }
-        bufIndex = 0; 
-      }
-    }
-  }
-}
-
+// Генерация ID (Renesas не имеет esp_random)
 String generateSessionPUID() {
   char buf[16];
-  snprintf(buf, sizeof(buf), "%08X", esp_random());
+  uint32_t seed = analogRead(A0) + micros();
+  snprintf(buf, sizeof(buf), "%08X", seed);
   return String(buf);
 }
 
-void setup() {
-  Serial.begin(115200);
-  Serial1.begin(115200, SERIAL_8N1, RADAR_RX_PIN, RADAR_TX_PIN);
-
+void connectToWiFi() {
+  Serial.print("Подключение к Wi-Fi");
+  // WiFiS3 автоматически свяжется с ESP32-S3 на плате
   WiFi.begin(ssid, password);
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
   }
+  Serial.println("\n✅ Wi-Fi подключен!");
+  Serial.print("IP: ");
+  Serial.println(WiFi.localIP());
+}
+
+bool sendToServer(const char* host, String json) {
+  WiFiClient client;
+  Serial.print("  → Отправка на ");
+  Serial.print(host);
   
-  sessionPUID = generateSessionPUID(); // Сохраняем в глобальную переменную
-  Serial.println("\nWiFi connected");
+  if (!client.connect(host, serverPort)) {
+    Serial.println(" [CONNECT FAIL]");
+    return false;
+  }
+
+  client.print("POST ");
+  client.print(endpoint);
+  client.println(" HTTP/1.1");
+  client.print("Host: ");
+  client.print(host);
+  client.print(":");
+  client.println(serverPort);
+  client.println("Content-Type: application/json");
+  client.print("Content-Length: ");
+  client.println(json.length());
+  client.println("Connection: close");
+  client.println();
+  client.println(json);
+
+  delay(100);
+  
+  bool success = false;
+  unsigned long timeout = millis() + 2000;
+  while (client.connected() || client.available()) {
+    if (client.available()) {
+       String line = client.readStringUntil('\n');
+       if (line.startsWith("HTTP/1.1")) {
+         int code = line.substring(9, 12).toInt();
+         success = (code == 200 || code == 201);
+         break;
+       }
+    }
+    if (millis() > timeout) break;
+  }
+  
+  client.stop();
+  Serial.println(success ? " [OK]" : " [ERROR]");
+  return success;
+}
+
+void storeReading(float distance) {
+  readings[readingIndex] = distance;
+  readingIndex = (readingIndex + 1) % MAX_READINGS;
+  if (validReadingsCount < MAX_READINGS) {
+    validReadingsCount++;
+  }
+}
+
+float calculateAverage() {
+  float sum = 0;
+  for (int i = 0; i < validReadingsCount; i++) {
+    sum += readings[i];
+  }
+  return sum / validReadingsCount;
+}
+
+int readUltrasonicFiltered(float* outSamples, int maxSamples) {
+  int validCount = 0;
+
+  for (int i = 0; i < SAMPLES_PER_INTERVAL && validCount < maxSamples; i++) {
+    digitalWrite(trigPin, LOW);
+    delayMicroseconds(2);
+    digitalWrite(trigPin, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(trigPin, LOW);
+
+    // pulseIn на Renecas работает стабильно
+    long duration = pulseIn(echoPin, HIGH, 150000L); 
+    
+    if (duration > 600) { 
+      outSamples[validCount++] = (duration * 0.0343) / 2.0;
+    }
+    
+    delay(100); 
+  }
+
+  if (validCount == 0) return 0;
+
+  // Сортировка пузырьком
+  for (int i = 0; i < validCount - 1; i++) {
+    for (int j = 0; j < validCount - i - 1; j++) {
+      if (outSamples[j] > outSamples[j + 1]) {
+        float temp = outSamples[j];
+        outSamples[j] = outSamples[j + 1];
+        outSamples[j + 1] = temp;
+      }
+    }
+  }
+
+    Serial.print("Отсортированные сэмплы: [");
+  for (int i = 0; i < validCount; i++) {
+    Serial.print(outSamples[i], 1); // 1 знак после запятой
+    if (i < validCount - 1) Serial.print(", ");
+  }
+  Serial.println("]");
+
+  return validCount;
+}
+
+void setup() {
+  Serial.begin(115200);
+  unsigned long timeout = millis() + 3000; 
+
+  while (!Serial && millis() < timeout) { 
+    delay(10); 
+  }
+
+  pinMode(trigPin, OUTPUT);
+  pinMode(echoPin, INPUT);
+
+  //connectToWiFi();
+
+  sessionPUID = generateSessionPUID();
+  Serial.print("Session PUID: ");
+  Serial.println(sessionPUID);
 }
 
 void loop() {
-  // 1. Постоянно читаем UART, чтобы не терять данные
-  parseRadarData(); 
+  unsigned long currentMillis = millis();
 
-  // 2. Проверяем таймер 5 минут
-  if (millis() - lastCheck >= CHECK_INTERVAL) {
+  if (currentMillis - previousMillis >= MEASURE_INTERVAL) {
+    previousMillis = currentMillis;
 
-    lastCheck = millis();
-    
-    float dist = lastDistanceCm;
-    Serial.print("Distance: "); Serial.println(dist);
+    // if (WiFi.status() != WL_CONNECTED) {
+    //   connectToWiFi();
+    // }
 
-    if (dist < 0) {
-        Serial.println("No radar data yet.");
-        return;
+    float samples[SAMPLES_PER_INTERVAL];
+    int validCount = readUltrasonicFiltered(samples, SAMPLES_PER_INTERVAL);
+
+    if (validCount == 0) {
+      Serial.println("⚠ Нет валидных измерений, пропуск.");
+      return;
     }
 
-    State newState = currentState;
+    int targetIndex = (int)(validCount * PERCENTILE_FACTOR);
+    if (targetIndex >= validCount) targetIndex = validCount - 1;
 
-    if (dist < MIN_DIST) {
-      Serial.println("ERROR: Distance too low. State unchanged.");
-      return; 
-    } 
-    else if (dist <= MAX_DIST) { // dist >= MIN_DIST уже проверено выше
-      newState = NOT_EMPTY;
-    } 
-    else { 
-      newState = EMPTY;
+    float distance = samples[targetIndex];
+    Serial.print("Distance: "); Serial.println(distance);
+
+    if (distance >= MIN_DISTANCE && distance <= MAX_DISTANCE) {
+      storeReading(distance);
+      float average = calculateAverage();
+      
+      Serial.print("Avg: "); Serial.println(average);
+
+      String samplesJson = "[";
+      for (int i = 0; i < validCount; i++) {
+        samplesJson += String(samples[i], 1);
+        if (i < validCount - 1) samplesJson += ",";
+      }
+      samplesJson += "]";
+
+      String json = "{\"puid\":\"" + sessionPUID + "|" + String(millis()) + "\","
+                    "\"sensor_id\":" + String(DEPTHMETER) + ","
+                    "\"depth\":" + String(distance, 1) + ","
+                    "\"samples\":" + samplesJson + "}";
+
+      for (int i = 0; i < SERVER_COUNT; i++) {
+    //    sendToServer(servers[i], json); 
+        delay(100);
+      }
     }
-
-    if (currentState == NOT_EMPTY && newState == EMPTY) {
-      taktCount++;
-      Serial.print("Takt counted! Total: "); Serial.println(taktCount);
-      sendData();
-    }
-
-    currentState = newState;
   }
-
-    if (millis() - lastHeartbeat >= HEARTBEAT_INTERVAL) {
-    sendHeartbeat();
-    lastHeartbeat = millis();
-  }
-}
-
-void sendData() {
-  String json = "{"
-                "\"puid\":\"" + sessionPUID + "|" + String(millis()) + "\","
-                "\"sensor_id\":" + String(TAKTOMETER) +
-                "}";
-
-  for (int i = 0; i < serverCount; i++) {
-    String url = "http://" + String(servers[i]) + ":" + String(serverPort) + "/takts";
-    HTTPClient http;
-    http.begin(url);
-    http.addHeader("Content-Type", "application/json");
-    
-    int httpCode = http.POST(json);
-    if (httpCode == HTTP_CODE_OK || httpCode == HTTP_CODE_CREATED) {
-      Serial.println("Data sent successfully to: " + String(servers[i]));
-      http.end();
-      return; 
-    }
-    
-    Serial.println("Failed to send to " + String(servers[i]) + ", Code: " + String(httpCode));
-    http.end();
-  }
-  Serial.println("ERROR: Failed to send data to all servers.");
 }

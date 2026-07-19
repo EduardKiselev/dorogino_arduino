@@ -3,19 +3,26 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <esp_wifi.h>
+#include <HTTPClient.h> 
 
 // === НАСТРОЙКИ ===
-#define CONTROLLER_ID 10  // ← Уникальный ID устройства (1-255)
+#define CONTROLLER_ID 1  // ← Уникальный ID устройства (1-255)
 const char* ssid = "ELTEX-8478";
 const char* pass = "eSm-kp7-VdF-PtA";
 
-
+const char* servers[] = {"192.168.1.100", "192.168.1.101"};
+const int serverCount = 2;
+const int serverPort = 5000;
 
 WebServer server(80);
 bool valveOpen = false;
 uint32_t openedAt = 0;
 const int VALVE_PIN = 25;
 const uint32_t CLOSE_DELAY = 300000; // 300 сек
+
+
+const unsigned long HEARTBEAT_INTERVAL = 60000;
+unsigned long lastHeartbeat = 0;
 
 void handleOpen() {
   Serial.println("[HTTP] GET /valve/open");
@@ -50,6 +57,28 @@ void setCustomMAC(uint32_t id) {
   
   Serial.printf("[MAC] Set: %02X:%02X:%02X:%02X:%02X:%02X\n", 
                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+void sendHeartbeat() {
+  String json = "{"
+                "\"device_type\":\"controller\","
+                "\"device_id\":" + String(CONTROLLER_ID) + ","
+                "\"health\":{"
+                  "\"rssi\":" + String(WiFi.RSSI()) + ","
+                  "\"heap\":" + String(ESP.getFreeHeap()) + ","
+                  "\"uptime\":" + String(millis()) +
+                "}"
+                "}";
+
+
+  String url = "http://" + String(servers[0]) + ":" + String(serverPort) + "/api/heartbeat";
+  HTTPClient http;
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+  int httpCode = http.POST(json);
+  Serial.printf("[HB] Sent to %s | Code: %d\n", servers[0], httpCode);
+  http.end();
+  
 }
 
 void setup() {
@@ -99,5 +128,10 @@ void loop() {
     digitalWrite(VALVE_PIN, LOW);
     valveOpen = false;
     Serial.println("[TIMER] Valve CLOSED (auto)");
+  }
+
+    if (millis() - lastHeartbeat >= HEARTBEAT_INTERVAL) {
+    sendHeartbeat();
+    lastHeartbeat = millis();
   }
 }
