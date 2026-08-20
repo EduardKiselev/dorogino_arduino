@@ -6,13 +6,18 @@
 #include <HTTPClient.h> 
 
 // === НАСТРОЙКИ ===
-#define CONTROLLER_ID 1  // ← Уникальный ID устройства (1-255)
+#define CONTROLLER_ID 6  // ← Уникальный ID устройства (1-255)
 const char* ssid = "ELTEX-8478";
 const char* pass = "eSm-kp7-VdF-PtA";
 
 const char* servers[] = {"192.168.1.100", "192.168.1.101"};
 const int serverCount = 2;
 const int serverPort = 5000;
+
+// Добавить эти переменные глобально:
+bool isReconnecting = false;
+unsigned long lastReconnectAttempt = 0;
+const unsigned long reconnectTimeout = 10000; // 10 секунд таймаут
 
 WebServer server(80);
 bool valveOpen = false;
@@ -59,6 +64,35 @@ void setCustomMAC(uint32_t id) {
                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 }
 
+// === Функция проверки и восстановления Wi-Fi ===
+void checkWiFiConnection() {
+  // Если подключены — выходим
+  if (WiFi.status() == WL_CONNECTED) {
+    isReconnecting = false;
+    return;
+  }
+
+  // Если разрыв произошел и мы еще не начали переподключение
+  if (!isReconnecting) {
+    Serial.println("[WIFI] Connection lost! Attempting to reconnect...");
+    WiFi.begin(ssid, pass);
+    isReconnecting = true;
+    lastReconnectAttempt = millis();
+  }
+
+  // Проверка таймаута попытки
+  if (isReconnecting && millis() - lastReconnectAttempt > reconnectTimeout) {
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("[WIFI] Reconnect attempt timed out. Will retry later.");
+      isReconnecting = false; // Сброс флага, чтобы попытаться снова в следующем цикле
+    } else {
+      Serial.println("[WIFI] Reconnected successfully!");
+      Serial.print("[WIFI] New IP: ");
+      Serial.println(WiFi.localIP());
+      isReconnecting = false;
+    }
+  }
+}
 void sendHeartbeat() {
   String json = "{"
                 "\"device_type\":\"controller\","
@@ -122,14 +156,19 @@ void setup() {
 
 
 void loop() {
+
+  checkWiFiConnection();
+
   server.handleClient();
   
+  // 3. Логика клапана
   if (valveOpen && millis() - openedAt >= CLOSE_DELAY) {
     digitalWrite(VALVE_PIN, LOW);
     valveOpen = false;
     Serial.println("[TIMER] Valve CLOSED (auto)");
   }
 
+  // 4. Heartbeat (отправляем только если есть связь)  
     if (millis() - lastHeartbeat >= HEARTBEAT_INTERVAL) {
     sendHeartbeat();
     lastHeartbeat = millis();

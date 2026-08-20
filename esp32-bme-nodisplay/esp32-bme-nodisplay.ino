@@ -6,16 +6,18 @@
 #include "esp_system.h"
 
 // === НАСТРОЙКИ ===
-const char* ssid = "ELTEX-8478";
-const char* password = "eSm-kp7-VdF-PtA";
-const int timeDelay = 60000;
+const char* ssid = "TP-LINK_LCV";
+const char* password = "";
+const int timeDelay = 3000;
 
 #define SENSOR_ID 2
 #define I2C_SDA 32
 #define I2C_SCL 33
 
-const char* servers[] = {"192.168.1.100", "192.168.1.101"};
-const int SERVER_COUNT = 2;
+const char* servers[] = {"192.168.4.144",};
+const int SERVER_COUNT = 1;
+
+
 const int serverPort = 5000;
 const char* endpoint = "/data";
 

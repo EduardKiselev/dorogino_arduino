@@ -1,316 +1,235 @@
-#include <WiFiS3.h> 
+/* esp32-bme-universal.ino */
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BME280.h>
+#include "esp_system.h"
 
-// ================= НАСТРОЙКИ ПОЛЬЗОВАТЕЛЯ =================
-#define DEPTHMETER 1 
+// === НАСТРОЙКИ ===
+
+#define HAS_DISPLAY  // //-для комментария
+const int SENSOR_ID = 23;
+
+// =================
+
+
+
 const char* ssid = "ELTEX-8478";
 const char* password = "eSm-kp7-VdF-PtA";
 
+const char* DEVICE_TYPE = "humidity_sensor"; // Тип устройства для heartbeat
+
+#define I2C_BME_SDA 32
+#define I2C_BME_SCL 33
+
+#ifdef HAS_DISPLAY
+#define I2C_DISP_SDA 21
+#define I2C_DISP_SCL 22
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#endif
+
+// Настройки отправки данных датчика
+const unsigned long MEASURE_INTERVAL = 60000; 
 const char* servers[] = {"192.168.1.100", "192.168.1.101"};
 const int SERVER_COUNT = 2;
 const int serverPort = 5000;
-const char* endpoint = "/depth";
-const int SAMPLES_PER_INTERVAL = 40;
-const float PERCENTILE_FACTOR = 0.8f; 
+const char* DATA_ENDPOINT = "/data";
 
-// Пины
-const int trigPin = 4; 
-const int echoPin = 5;
+// Настройки Heartbeat
+const unsigned long HEARTBEAT_INTERVAL = 60000; // Раз в минуту
+const char* HEARTBEAT_ENDPOINT = "/api/heartbeat";
 
-const unsigned long MEASURE_INTERVAL = 10000; 
+TwoWire I2C_BME = TwoWire(0);
+Adafruit_BME280 bme;
+WiFiClient wifiClient;
+bool bmeReady = false;
+String sessionPUID;
 
-const float MIN_DISTANCE = 10;
-const float MAX_DISTANCE = 2000.0;
+#ifdef HAS_DISPLAY
+TwoWire I2C_DISP = TwoWire(1);
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &I2C_DISP, -1);
+#endif
 
-// Настройки фильтрации по истории
-const int HISTORY_SIZE = 20;
-const float DEVIATION_THRESHOLD = 5.0; // Допустимое отклонение от медианы (см)
-// ==========================================================
+unsigned long lastMeasureMillis = 0;
+unsigned long lastHeartbeatMillis = 0;
+unsigned long lastStatusCheckMillis = 0;
+unsigned long lastDisplayRefreshMillis = 0;
 
-// Таймер для heartbeat
-const unsigned long HEARTBEAT_INTERVAL = 60000; // раз в 60 сек
-unsigned long lastHeartbeat = 0;
+struct SensorData { float h = 0, t = 0, p = 0; bool valid = false; } lastData;
 
-unsigned long previousMillis = 0;
+#ifdef HAS_DISPLAY
+void drawStatus(const String& msg, bool isError) {
+  display.clearDisplay(); display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(isError ? 2 : 1); display.setCursor(0, 0);
+  display.println(msg); display.display();
+}
+void drawData(float h, float t, float p) {
+  display.clearDisplay(); display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0); display.setTextSize(4);
+  display.print(h, 1); display.println("%");
+  display.setTextSize(1); display.setCursor(0, 48);
+  display.print("T:"); display.print(t, 1); display.print("C  P:");
+  display.print(p, 0); display.println(" hPa"); display.display();
+}
+#else
+void drawStatus(const String&, bool) {}
+void drawData(float, float, float) {}
+#endif
 
-// Буфер истории измерений для медианного фильтра
-float depthHistory[HISTORY_SIZE] = {0};
-int historyIndex = 0;
-int historyCount = 0;
-
-String sessionPUID = ""; 
-
-// Генерация ID (Renesas не имеет esp_random)
 String generateSessionPUID() {
-  char buf[16];
-  uint32_t seed = analogRead(A0) + micros();
-  snprintf(buf, sizeof(buf), "%08X", seed);
-  return String(buf);
+  char buf[16]; snprintf(buf, sizeof(buf), "%08X", esp_random()); return String(buf);
 }
 
-void connectToWiFi() {
-  Serial.print("Подключение к Wi-Fi");
-  // WiFiS3 автоматически свяжется с ESP32-S3 на плате
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
+bool initBME() {
+  I2C_BME.begin(I2C_BME_SDA, I2C_BME_SCL, 400000);
+  if (bme.begin(0x76, &I2C_BME) || bme.begin(0x77, &I2C_BME)) {
+    Serial.println("BME280 OK"); return true;
   }
-  Serial.println("\n Wi-Fi подключен!");
-  Serial.print("IP: ");
-  Serial.println(WiFi.localIP());
+  Serial.println("BME280 FAIL"); return false;
 }
 
-bool sendToServer(const char* host, String json) {
-  WiFiClient client;
-  Serial.print("  → Отправка на ");
-  Serial.print(host);
-  
-  if (!client.connect(host, serverPort)) {
-    Serial.println(" [CONNECT FAIL]");
-    return false;
+#ifdef HAS_DISPLAY
+bool initDisplay() {
+  I2C_DISP.begin(I2C_DISP_SDA, I2C_DISP_SCL, 400000);
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("Display FAIL"); return false;
   }
+  display.setTextSize(1); return true;
+}
+#else
+bool initDisplay() { return true; }
+#endif
 
-  client.print("POST ");
-  client.print(endpoint);
-  client.println(" HTTP/1.1");
-  client.print("Host: ");
-  client.print(host);
-  client.print(":");
-  client.println(serverPort);
-  client.println("Content-Type: application/json");
-  client.print("Content-Length: ");
-  client.println(json.length());
-  client.println("Connection: close");
-  client.println();
-  client.println(json);
-
-  delay(100);
-  
-  bool success = false;
-  unsigned long timeout = millis() + 2000;
-  while (client.connected() || client.available()) {
-    if (client.available()) {
-       String line = client.readStringUntil('\n');
-       if (line.startsWith("HTTP/1.1")) {
-         int code = line.substring(9, 12).toInt();
-         success = (code == 200 || code == 201);
-         break;
-       }
-    }
-    if (millis() > timeout) break;
+// Отправка данных датчика
+bool sendDataToServer(const char* host, const String& json) {
+  HTTPClient http; 
+  String url = "http://" + String(host) + ":" + String(serverPort) + DATA_ENDPOINT;
+  Serial.print("DATA -> "); Serial.print(host);
+  if (http.begin(wifiClient, url)) {
+    http.addHeader("Content-Type", "application/json");
+    int code = http.POST(json);
+    Serial.print(" ["); Serial.print(code); Serial.println("]");
+    http.end(); return (code == 200 || code == 201);
   }
-  
-  client.stop();
-  Serial.println(success ? " [OK]" : " [ERROR]");
-  return success;
+  Serial.println(" [HTTP ERR]"); return false;
 }
 
-// Вычисление медианы из текущего буфера
-float getMedianFromHistory() {
-  float sorted[HISTORY_SIZE];
-  // Копируем только валидные элементы
-  for(int i = 0; i < historyCount; i++) {
-    sorted[i] = depthHistory[i];
-  }
-  
-  // Сортировка пузырьком (для N=20 очень быстрая)
-  for (int i = 0; i < historyCount - 1; i++) {
-    for (int j = 0; j < historyCount - i - 1; j++) {
-      if (sorted[j] > sorted[j + 1]) {
-        float temp = sorted[j];
-        sorted[j] = sorted[j + 1];
-        sorted[j + 1] = temp;
-      }
-    }
-  }
-  
-  if (historyCount % 2 == 0) {
-    return (sorted[historyCount / 2 - 1] + sorted[historyCount / 2]) / 2.0;
-  } else {
-    return sorted[historyCount / 2];
-  }
-}
-
-int readUltrasonicFiltered(float* outSamples, int maxSamples) {
-  int validCount = 0;
-
-  for (int i = 0; i < SAMPLES_PER_INTERVAL && validCount < maxSamples; i++) {
-    digitalWrite(trigPin, LOW);
-    delayMicroseconds(2);
-    digitalWrite(trigPin, HIGH);
-    delayMicroseconds(10);
-    digitalWrite(trigPin, LOW);
-
-    // pulseIn на Renesas работает стабильно
-    long duration = pulseIn(echoPin, HIGH, 150000L); 
-    
-    if (duration > 600) { 
-      outSamples[validCount++] = (duration * 0.0343) / 2.0;
-    }
-    
-    delay(100); 
-  }
-
-  if (validCount == 0) return 0;
-
-    Serial.print(" сэмплы: [");
-  for (int i = 0; i < validCount; i++) {
-    Serial.print(outSamples[i], 1); 
-    if (i < validCount - 1) Serial.print(", ");
-  }
-  Serial.println("]");
-
-  // Сортировка пузырьком для отсечения шума
-  for (int i = 0; i < validCount - 1; i++) {
-    for (int j = 0; j < validCount - i - 1; j++) {
-      if (outSamples[j] > outSamples[j + 1]) {
-        float temp = outSamples[j];
-        outSamples[j] = outSamples[j + 1];
-        outSamples[j + 1] = temp;
-      }
-    }
-  }
-
-  return validCount;
-}
-
+// === HEARTBEAT ===
 void sendHeartbeat() {
-  if (WiFi.status() != WL_CONNECTED) return;
-
-  int heap = 0;
-
-  String json = "{"
-                "\"device_type\":\"depth_meter\","
-                "\"device_id\":" + String(DEPTHMETER) + ","
-                "\"health\":{"
-                  "\"rssi\":" + String(WiFi.RSSI()) + ","
-                  "\"heap\":" + String(heap) + ","
-                  "\"uptime\":" + String(millis()) +
-                "}"
-                "}";
-
-  const char* hbHost = servers[0];
-  WiFiClient client;
-  if (client.connect(hbHost, serverPort)) {
-    client.print("POST /api/heartbeat HTTP/1.1\r\n");
-    client.print("Host: " + String(hbHost) + "\r\n");
-    client.print("Content-Type: application/json\r\n");
-    client.print("Content-Length: " + String(json.length()) + "\r\n");
-    client.print("Connection: close\r\n\r\n");
-    client.print(json);
-    
-    Serial.print("[HB] Sent -> ");
-    Serial.print(hbHost);
-    Serial.print(" | RSSI: ");
-    Serial.print(WiFi.RSSI());
-    Serial.print(" | Heap: ");
-    Serial.println(heap);
-    client.stop();
-  } else {
-    Serial.println("[HB] Connection failed");
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("HB SKIP: No WiFi");
+    return;
   }
+
+  int heap = ESP.getFreeHeap();
+  String json = "{"
+    "\"device_type\":\"" + String(DEVICE_TYPE) + "\","
+    "\"device_id\":" + String(SENSOR_ID) + ","
+    "\"health\":{"
+      "\"rssi\":" + String(WiFi.RSSI()) + ","
+      "\"heap\":" + String(heap) + ","
+      "\"uptime\":" + String(millis()) +
+    "}"
+  "}";
+
+  HTTPClient http;
+  // Берем первый сервер для heartbeat
+  String url = "http://" + String(servers[0]) + ":" + String(serverPort) + HEARTBEAT_ENDPOINT;
+  
+  Serial.print("HB -> "); Serial.println(servers[0]);
+  if (http.begin(wifiClient, url)) {
+    http.addHeader("Content-Type", "application/json");
+    int code = http.POST(json);
+    Serial.print(" ["); Serial.print(code); Serial.println("]");
+    http.end();
+  } else {
+    Serial.println("HB HTTP ERR");
+  }
+}
+
+void ProcessMeasure() {
+  if (!bmeReady) {
+    if (initBME()) { bmeReady = true; 
+      #ifdef HAS_DISPLAY 
+        drawStatus("Sensor Ready", false); 
+      #endif 
+    }
+    else { 
+      #ifdef HAS_DISPLAY 
+        drawStatus("Sensor ERR", true); 
+        #endif 
+      return; 
+      }
+  }
+  float t = bme.readTemperature(), h = bme.readHumidity(), p = bme.readPressure() / 100.0F;
+  if (isnan(t) || isnan(h) || isnan(p)) {
+    Serial.println("Read ERR"); bmeReady = false; lastData.valid = false;
+    #ifdef HAS_DISPLAY 
+      drawStatus("Read ERR", true); 
+    #endif 
+    return;
+  }
+  lastData.t = t; lastData.h = h; lastData.p = p; lastData.valid = true;
+  
+  #ifdef HAS_DISPLAY 
+    drawData(h, t, p); 
+  #endif
+  
+  Serial.printf("Data: T=%.1f H=%.1f P=%.1f\n", t, h, p);
+  String json = "{\"puid\":\"" + sessionPUID + "|" + String(millis()) + "\","
+                "\"sensor_id\":" + String(SENSOR_ID) + ","
+                "\"temperature\":" + String(t, 1) + ","
+                "\"humidity\":" + String(h, 1) + ","
+                "\"pressure\":" + String(p, 1) + "}";
+  for (int i = 0; i < SERVER_COUNT; i++) { sendDataToServer(servers[i], json); delay(100); }
 }
 
 void setup() {
-  Serial.begin(115200);
-  unsigned long timeout = millis() + 3000; 
-
-  while (!Serial && millis() < timeout) { 
-    delay(10); 
-  }
-
-  pinMode(trigPin, OUTPUT);
-  pinMode(echoPin, INPUT);
-
-  connectToWiFi();
-
+  Serial.begin(9600); delay(1000); Serial.println("ESP32 BME Logger");
+  if (initDisplay()) Serial.println("Display OK");
   sessionPUID = generateSessionPUID();
-  Serial.print("Session PUID: ");
-  Serial.println(sessionPUID);
+  bmeReady = initBME();
+  Serial.print("Wi-Fi: "); WiFi.begin(ssid, password);
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) { delay(500); Serial.print("."); }
+  Serial.println(WiFi.status() == WL_CONNECTED ? " OK" : " FAIL");
 }
 
 void loop() {
-  unsigned long currentMillis = millis();
+  unsigned long now = millis();
 
-  if (currentMillis - lastHeartbeat >= HEARTBEAT_INTERVAL) {
+  // 1. Мониторинг Wi-Fi
+  if (WiFi.status() != WL_CONNECTED) {
+    if (now - lastStatusCheckMillis > 5000) {
+      lastStatusCheckMillis = now; Serial.println("WiFi Lost. Reconnecting...");
+      WiFi.reconnect(); 
+      #ifdef HAS_DISPLAY 
+        drawStatus("No WiFi", true); 
+      #endif
+    }
+    return;
+  }
+
+  // 2. Heartbeat (Отправка здоровья системы)
+  if (now - lastHeartbeatMillis >= HEARTBEAT_INTERVAL) {
+    lastHeartbeatMillis = now;
     sendHeartbeat();
-    lastHeartbeat = currentMillis;
   }
 
-  if (currentMillis - previousMillis >= MEASURE_INTERVAL) {
-    previousMillis = currentMillis;
-
-    if (WiFi.status() != WL_CONNECTED) {
-      connectToWiFi();
-    }
-
-    float samples[SAMPLES_PER_INTERVAL];
-    int validCount = readUltrasonicFiltered(samples, SAMPLES_PER_INTERVAL);
-
-    if (validCount == 0) {
-      Serial.println("⚠ Нет валидных измерений, пропуск.");
-      return;
-    }
-
-    int targetIndex = (int)(validCount * PERCENTILE_FACTOR);
-    if (targetIndex >= validCount) targetIndex = validCount - 1;
-
-    // Усредняем верхние значения (фильтрация аппаратного шума)
-    float tailSum = 0.0;
-    int count = validCount - targetIndex;
-    for (int i = targetIndex; i < validCount; i++) {
-      tailSum += samples[i];
-    }
-    
-    float distance = (count > 0) ? (tailSum / count) : samples[targetIndex];
-
-    Serial.print("Distance: "); Serial.println(distance);
-
-    if (distance >= MIN_DISTANCE && distance <= MAX_DISTANCE) {
-      
-      // Фильтрация по истории
-      bool shouldSend = true;
-
-      // Проверяем, есть ли достаточно данных для сравнения
-      if (historyCount >= HISTORY_SIZE) {
-        float median = getMedianFromHistory();
-        float diff = distance - median;
-        if (diff < 0) diff = -diff; // абсолютное значение
-
-        if (diff > DEVIATION_THRESHOLD) {
-          shouldSend = false;
-          Serial.print("⚠ Отклонение: "); Serial.print(diff, 1); 
-          Serial.print(" см. Пропуск отправки. Медиана: "); Serial.println(median, 1);
-        }
-      } else {
-        Serial.println("⚡ Массив истории заполняется, отправка без фильтра.");
-      }
-
-      // Всегда сохраняем замер в историю
-      depthHistory[historyIndex] = distance;
-      historyIndex = (historyIndex + 1) % HISTORY_SIZE;
-      if (historyCount < HISTORY_SIZE) {
-        historyCount++;
-      }
-
-      if (shouldSend) {
-        String samplesJson = "[";
-        for (int i = 0; i < validCount; i++) {
-          samplesJson += String(samples[i], 1);
-          if (i < validCount - 1) samplesJson += ",";
-        }
-        samplesJson += "]";
-
-        String json = "{\"puid\":\"" + sessionPUID + "|" + String(millis()) + "\","
-                      "\"sensor_id\":" + String(DEPTHMETER) + ","
-                      "\"depth\":" + String(distance, 1) + ","
-                      "\"samples\":" + samplesJson + "}";
-
-        for (int i = 0; i < SERVER_COUNT; i++) {
-          sendToServer(servers[i], json); 
-          delay(100);
-        }
-      }
-    }
+  // 3. Измерение данных датчика (Синхронизировано с Heartbeat по умолчанию, но интервалы можно менять)
+  if (now - lastMeasureMillis >= MEASURE_INTERVAL) {
+    lastMeasureMillis = now;
+    ProcessMeasure();
   }
+
+  // 4. Обновление дисплея
+  #ifdef HAS_DISPLAY
+  if (now - lastDisplayRefreshMillis > 2000 && lastData.valid) {
+    lastDisplayRefreshMillis = now; drawData(lastData.h, lastData.t, lastData.p);
+  }
+  #endif
 }
