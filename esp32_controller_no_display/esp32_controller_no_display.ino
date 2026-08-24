@@ -6,7 +6,7 @@
 #include <HTTPClient.h> 
 
 // === НАСТРОЙКИ ===
-#define CONTROLLER_ID 6  // ← Уникальный ID устройства (1-255)
+#define CONTROLLER_ID 3  // ← Уникальный ID устройства (1-255)
 const char* ssid = "ELTEX-8478";
 const char* pass = "eSm-kp7-VdF-PtA";
 
