@@ -137,4 +137,78 @@ void sendHeartbeat() {
       Serial.println("[WIFI] 3 consecutive HB failures. Forcing Wi-Fi reconnect...");
       WiFi.disconnect(true);
       isReconnecting = false; // Сбросим флаг, чтобы checkWiFiConnection сразу начал переподключение
-      failedHeartbeats
+      failedHeartbeats = 0;
+    }
+  }
+  http.end();
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n[INIT] ESP32 booting...");
+
+  pinMode(VALVE_PIN, OUTPUT);
+  digitalWrite(VALVE_PIN, LOW);
+
+  // === 1. Полный сброс перед настройкой ===
+  WiFi.disconnect(true);
+  delay(100);
+  
+  WiFi.mode(WIFI_STA);
+  setCustomMAC(CONTROLLER_ID + 200);
+
+  // === 2. Задаём имя хоста ===
+  char hostname[32];
+  snprintf(hostname, sizeof(hostname), "esp32-controller-%d", CONTROLLER_ID);
+  WiFi.setHostname(hostname);
+  Serial.printf("[HOST] Set: %s\n", hostname);
+
+  // === 3. Подключаемся к Wi-Fi с таймаутом ===
+  Serial.printf("[WIFI] Connecting to '%s'...", ssid);
+  WiFi.begin(ssid, pass);
+  
+  unsigned long connectStart = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - connectStart < 15000) {
+    delay(500);
+    Serial.print(".");
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("\n[WIFI] Connected! IP: %s\n", WiFi.localIP().toString().c_str());
+    Serial.printf("[INFO] Hostname: %s, MAC: %s\n", 
+                  WiFi.getHostname(), WiFi.macAddress().c_str());
+  } else {
+    Serial.println("\n[WIFI] Initial connection failed. Will retry in loop.");
+  }
+
+  // === HTTP сервер ===
+  server.on("/valve/open", HTTP_GET, handleOpen);
+  server.on("/valve/close", HTTP_GET, handleClose);
+  server.on("/", HTTP_GET, []() {
+    server.send(200, "text/plain", "ESP32 Valve Controller\nEndpoints: /valve/open, /valve/close");
+  });
+
+  server.begin();
+  Serial.println("[HTTP] Server listening on port 80");
+}
+
+void loop() {
+  // 1. Проверка и восстановление Wi-Fi
+  checkWiFiConnection();
+
+  // 2. Обработка HTTP запросов
+  server.handleClient();
+  
+  // 3. Логика клапана
+  if (valveOpen && millis() - openedAt >= CLOSE_DELAY) {
+    digitalWrite(VALVE_PIN, LOW);
+    valveOpen = false;
+    Serial.println("[TIMER] Valve CLOSED (auto)");
+  }
+
+  // 4. Heartbeat (отправляем только если есть связь)  
+  if (millis() - lastHeartbeat >= HEARTBEAT_INTERVAL) {
+    sendHeartbeat();
+    lastHeartbeat = millis();
+  }
+}
