@@ -11,7 +11,7 @@
 const char* ssid = "ELTEX-8478";
 const char* password = "eSm-kp7-VdF-PtA";
 
-const int SENSOR_ID = 2;
+const int SENSOR_ID = 12;
 #define I2C_SDA 32
 #define I2C_SCL 33
 
@@ -49,6 +49,7 @@ struct SensorData {
     display.setTextSize(isError ? 2 : 1);
     display.setCursor(0, 0);
     display.println(msg);
+    I2C_BME.begin(I2C_SDA, I2C_SCL, 400000);  // Восстанавливаем пины перед отправкой
     display.display();
   }
 
@@ -63,6 +64,7 @@ struct SensorData {
     display.setCursor(0, 48);
     display.print("T:"); display.print(t, 1); display.print("C  P:");
     display.print(p, 0); display.println(" hPa");
+    I2C_BME.begin(I2C_SDA, I2C_SCL, 400000);  // Восстанавливаем пины перед отправкой
     display.display();
   }
 #else
@@ -77,8 +79,8 @@ String generateSessionPUID() {
 }
 
 bool initBME() {
-  I2C_BME.begin(I2C_SDA, I2C_SCL, 400000);
   if (bme.begin(0x76, &I2C_BME) || bme.begin(0x77, &I2C_BME)) {
+    I2C_BME.begin(I2C_SDA, I2C_SCL, 400000);  // Восстанавливаем пины после bme.begin()
     Serial.println("BME280 OK");
     return true;
   }
@@ -154,6 +156,8 @@ void setup() {
   delay(1000);
   Serial.println("ESP32 BME Logger");
 
+  I2C_BME.begin(I2C_SDA, I2C_SCL, 400000);
+
   #ifdef HAS_DISPLAY
     if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
       Serial.println("Display FAIL");
@@ -174,6 +178,8 @@ void setup() {
     Serial.print(".");
   }
   Serial.println(WiFi.status() == WL_CONNECTED ? " OK" : " FAIL");
+  
+  lastHeartbeatMillis = millis();
 }
 
 void loop() {
@@ -188,10 +194,7 @@ void loop() {
         drawStatus("No WiFi", true);
       #endif
     }
-    return;
-  }
-
-  if (now - lastHeartbeatMillis >= HEARTBEAT_INTERVAL) {
+  } else if (now - lastHeartbeatMillis >= HEARTBEAT_INTERVAL) {
     lastHeartbeatMillis = now;
     ProcessHeartbeat();
   }
@@ -199,6 +202,7 @@ void loop() {
   #ifdef HAS_DISPLAY
     if (now - lastDisplayRefreshMillis > 2000 && lastData.valid) {
       lastDisplayRefreshMillis = now;
+      Serial.println(" DISPLAY REFRESH");
       drawData(lastData.h, lastData.t, lastData.p);
     }
   #endif

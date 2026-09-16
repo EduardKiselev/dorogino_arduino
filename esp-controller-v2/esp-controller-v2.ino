@@ -6,7 +6,7 @@
 #include <HTTPClient.h> 
 
 // === НАСТРОЙКИ ===
-#define CONTROLLER_ID 3  // ← Уникальный ID устройства (1-255)
+#define CONTROLLER_ID 5  // ← Уникальный ID устройства (1-255)
 const char* ssid = "ELTEX-8478";
 const char* pass = "eSm-kp7-VdF-PtA";
 
@@ -118,7 +118,7 @@ void sendHeartbeat() {
 
   String url = "http://" + String(servers[0]) + ":" + String(serverPort) + "/api/heartbeat";
   HTTPClient http;
-  http.setTimeout(3000); // ВАЖНО: Таймаут 3 сек, чтобы не вешать loop при проблемах сети
+  http.setTimeout(3000);
   http.begin(url);
   http.addHeader("Content-Type", "application/json");
   
