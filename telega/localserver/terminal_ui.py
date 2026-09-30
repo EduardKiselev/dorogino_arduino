@@ -5,6 +5,8 @@ import hashlib
 import time
 import logging
 import os
+import psutil
+import requests
 import serial
 from pathlib import Path
 from dotenv import load_dotenv
@@ -23,10 +25,15 @@ logger = logging.getLogger(__name__)
 
 SERIAL_PORT = '/dev/ttyUSB0'
 BAUDRATE = 115200
+HEARTBEAT_INTERVAL = 60   # секунды
 
 # Загружаем .env файл
 ENV_FILE = Path(__file__).parent / '.env'
 load_dotenv(ENV_FILE)
+
+# Конфигурация heartbeat из .env
+HEARTBEAT_SERVER = os.getenv('HB_SERVER', 'http://enter_server:1111')
+DEVICE_ID = os.getenv('DEVICE_ID', '1')
 
 
 class TerminalUI(QWidget):
@@ -34,18 +41,63 @@ class TerminalUI(QWidget):
         super().__init__()
         self.records = []
         self.current_weight = 0.0
-        self.last_fix_weight = 0.0  # Вес при последней фиксации
+        self.last_fix_weight = 0.0
         self.is_on_target = False
         self.current_tag = ""
         self.current_bin_name = ""
         self.last_rfid_time = 0.0
+        self.start_time = time.time()
 
         self.rfid_mapping = self.load_rfid_mapping()
         self.admin_password_hash = self.load_admin_password()
 
         self.init_ui()
         self.init_serial()
+        self.init_heartbeat()
 
+    def init_heartbeat(self):
+        """Инициализирует таймер отправки heartbeat."""
+        self.heartbeat_timer = QTimer()
+        self.heartbeat_timer.timeout.connect(self.send_heartbeat)
+        self.heartbeat_timer.start(HEARTBEAT_INTERVAL * 1000)
+        logger.info(f"💓 Heartbeat запущен: интервал {HEARTBEAT_INTERVAL}с, сервер {HEARTBEAT_SERVER}")
+
+    def send_heartbeat(self):
+        """Отправляет heartbeat на сервер с системной информацией."""
+        try:
+            # Собираем системную информацию
+            memory = psutil.virtual_memory()
+            cpu_percent = psutil.cpu_percent(interval=0.1)
+            uptime = int(time.time() - self.start_time)
+            
+            payload = {
+                "device_type": "terminal",
+                "device_id": DEVICE_ID,
+                "health": {
+                    "cpu_percent": cpu_percent,
+                    "memory_percent": memory.percent,
+                    "memory_available_mb": memory.available // (1024 * 1024),
+                    "uptime_seconds": uptime,
+                    "serial_connected": self.ser is not None,
+                    "is_on_target": self.is_on_target,
+                    "current_weight": self.current_weight
+                }
+            }
+            
+            url = f"{HEARTBEAT_SERVER}/api/heartbeat"
+            response = requests.post(url, json=payload, timeout=5)
+            
+            if response.status_code == 200:
+                logger.debug(f"💓 Heartbeat отправлен -> CPU: {cpu_percent:.1f}%, RAM: {memory.percent:.1f}%, Uptime: {uptime}с")
+            else:
+                logger.warning(f"💓 Heartbeat ответ: {response.status_code}")
+                
+        except requests.exceptions.ConnectionError:
+            logger.warning(f"💓 Heartbeat не удалось подключиться к {HEARTBEAT_SERVER}")
+        except requests.exceptions.Timeout:
+            logger.warning(f"💓 Heartbeat таймаут подключения")
+        except Exception as e:
+            logger.error(f"💓 Heartbeat ошибка: {e}")
     # ---------- .ENV ----------
     def load_rfid_mapping(self):
         """Загружает маппинг RFID UID → название бункера из .env файла."""
@@ -313,9 +365,13 @@ class TerminalUI(QWidget):
             self.close_app()
 
     def close_app(self):
+        """Закрывает приложение и освобождает ресурсы."""
+        if hasattr(self, 'heartbeat_timer'):
+            self.heartbeat_timer.stop()
         if self.ser:
             self.ser.close()
         QApplication.quit()
+
 
     # ---------- КНОПКИ ----------
     def fix_weight(self):
