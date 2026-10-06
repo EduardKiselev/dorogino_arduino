@@ -42,7 +42,7 @@ logger = logging.getLogger(__name__)
 
 
 REMOTE_SERVER_API = os.getenv('REMOTE_SERVER_API', 'http://server:8080/api/records')
-SERIAL_PORT = '/dev/ttyUSB0'
+SERIAL_PORT = '/dev/arduino'
 BAUDRATE = 115200
 HEARTBEAT_INTERVAL = 60   # секунды
 
