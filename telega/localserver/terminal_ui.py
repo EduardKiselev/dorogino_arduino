@@ -10,7 +10,6 @@ import psutil
 import requests
 import serial
 from pathlib import Path
-from collections import deque
 from dotenv import load_dotenv
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
@@ -42,11 +41,10 @@ logger = logging.getLogger(__name__)
 
 
 REMOTE_SERVER_API = os.getenv('REMOTE_SERVER_API', 'http://server:8080/api/records')
-SERIAL_PORT = '/dev/ttyUSB0'
+SERIAL_PORT = '/dev/ttyUSB1'       # RFID (PN532)
+WEIGHT_SERIAL_PORT = '/dev/ttyUSB0' # Весовой контроллер
 BAUDRATE = 115200
 HEARTBEAT_INTERVAL = 60   # секунды
-
-CALIBRATION_FILE = Path(__file__).parent / 'calibration.json'
 
 
 
@@ -67,20 +65,16 @@ class TerminalUI(QWidget):
         self.last_rfid_time = 0.0
         self.start_time = time.time()
 
-        # Калибровочные константы
-        self.zero_offset = 0
-        self.counts_per_kg = 1000000.0
-        
-        # Буфер для фильтрации raw данных
-        self.raw_buffer = deque(maxlen=10)
-        self.last_raw_value = None
+        # Весовой порт (USB0)
+        self.weight_ser = None
+        self.weight_buf = ""
 
         self.rfid_mapping = self.load_rfid_mapping()
         self.admin_password_hash = self.load_admin_password()
-        self.load_calibration()
 
         self.init_ui()
         self.init_serial()
+        self.init_weight_serial()
         self.init_heartbeat()
 
     def init_heartbeat(self):
@@ -150,53 +144,6 @@ class TerminalUI(QWidget):
 
         return hashlib.sha256(password.encode()).hexdigest()
 
-
-    # ---------- КАЛИБРОВКА ----------
-    def load_calibration(self):
-        """Загружает калибровочные константы из файла."""
-        if CALIBRATION_FILE.exists():
-            try:
-                with open(CALIBRATION_FILE, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    self.zero_offset = data.get('zero_offset', 0)
-                    self.counts_per_kg = data.get('counts_per_kg', 1000000.0)
-                logger.info(f"📊 Калибровка загружена: zero={self.zero_offset}, counts/kg={self.counts_per_kg:.0f}")
-            except Exception as e:
-                logger.error(f"❌ Ошибка загрузки калибровки: {e}")
-        else:
-            logger.warning(f"⚠️ Файл калибровки не найден, используются значения по умолчанию")
-
-    def save_calibration(self):
-        """Сохраняет калибровочные константы в файл."""
-        try:
-            data = {
-                'zero_offset': self.zero_offset,
-                'counts_per_kg': self.counts_per_kg,
-            }
-            with open(CALIBRATION_FILE, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-            logger.info(f"💾 Калибровка сохранена: {data}")
-        except Exception as e:
-            logger.error(f"❌ Ошибка сохранения калибровки: {e}")
-
-    def process_loadcell_raw(self, raw):
-        """Обрабатывает сырые данные тензодатчика и пересчитывает в вес."""
-        self.raw_buffer.append(raw)
-        self.last_raw_value = raw
-        
-        # Медианный фильтр для устранения выбросов
-        sorted_raw = sorted(self.raw_buffer)
-        median_raw = sorted_raw[len(sorted_raw) // 2]
-        
-        # Пересчет в килограммы
-        if self.counts_per_kg != 0:
-            weight_kg = (median_raw - self.zero_offset) / self.counts_per_kg
-        else:
-            weight_kg = 0.0
-        
-        self.current_weight = weight_kg
-        self.update_weight_display()
-        logger.debug(f"⚖️ Raw: {raw}, Median: {median_raw}, Weight: {self.current_weight:.2f} кг")
 
     # ---------- ИНТЕРФЕЙС ----------
     def init_ui(self):
@@ -310,6 +257,65 @@ class TerminalUI(QWidget):
         self.position_timer.timeout.connect(self.check_position_timeout)
         self.position_timer.start(200)
 
+    def init_weight_serial(self):
+        """Инициализирует весовой порт (USB0)."""
+        try:
+            self.weight_ser = serial.Serial(WEIGHT_SERIAL_PORT, BAUDRATE, timeout=0.1)
+            logger.info(f"✅ Весовой порт открыт: {WEIGHT_SERIAL_PORT}")
+        except Exception as e:
+            logger.error(f"❌ Ошибка весового порта: {e}")
+            self.weight_ser = None
+
+        # Таймер опроса весового порта
+        self.weight_timer = QTimer()
+        self.weight_timer.timeout.connect(self.read_weight_serial)
+        self.weight_timer.start(100)
+
+    def read_weight_serial(self):
+        """Читает и обрабатывает данные с весового порта (USB0)."""
+        if not self.weight_ser:
+            return
+
+        if self.weight_ser.in_waiting:
+            try:
+                chunk = self.weight_ser.read(self.weight_ser.in_waiting).decode('utf-8', errors='ignore')
+                self.weight_buf += chunk
+            except Exception as e:
+                logger.error(f"❌ Ошибка чтения весового порта: {e}")
+                return
+
+        # Парсим формат: +XXXXX.X#+YYYYY.YD\r
+        while '\r' in self.weight_buf or '\n' in self.weight_buf:
+            cr_pos = self.weight_buf.find('\r')
+            lf_pos = self.weight_buf.find('\n')
+
+            if cr_pos == -1 and lf_pos == -1:
+                break
+
+            if cr_pos == -1:
+                end_pos = lf_pos
+            elif lf_pos == -1:
+                end_pos = cr_pos
+            else:
+                end_pos = min(cr_pos, lf_pos)
+
+            line = self.weight_buf[:end_pos].strip()
+            self.weight_buf = self.weight_buf[end_pos + 1:]
+
+            if not line or '#' not in line:
+                continue
+
+            parts = line.split('#')
+            if len(parts) == 2:
+                try:
+                    value2_str = parts[1].rstrip('D')
+                    weight = float(value2_str)
+                    self.current_weight = weight
+                    self.update_weight_display()
+                    logger.debug(f"⚖️ Вес: {weight:.1f}")
+                except ValueError:
+                    pass
+
     def read_serial(self):
         """Читает и обрабатывает данные из serial порта."""
         if not self.ser:
@@ -349,17 +355,7 @@ class TerminalUI(QWidget):
             logger.debug(f"📨 Получено от ESP32: {json_str}")
             logger.debug(f"📦 Тип данных: {dtype}")
 
-            if dtype == "weight":
-                self.current_weight = data.get("value", 0.0)
-                self.update_weight_display()
-                logger.debug(f"⚖️ Вес обновлён: {self.current_weight:.1f} кг")
-
-            elif dtype == "loadcell":
-                raw = data.get("raw")
-                if raw is not None:
-                    self.process_loadcell_raw(int(raw))
-
-            elif dtype == "rfid":
+            if dtype == "rfid":
                 uid = data.get("uid", "")
                 self.current_tag = uid
                 self.last_rfid_time = time.time()
@@ -471,71 +467,15 @@ class TerminalUI(QWidget):
             }
         """)
 
-        btn_reset_zero = dialog.addButton("🎯 Сбросить 0", QMessageBox.ActionRole)
-        btn_set_coeff = dialog.addButton("📐 Установить коэффициент (counts/kg)", QMessageBox.ActionRole)
         btn_exit = dialog.addButton("🚪 Выйти из программы", QMessageBox.ActionRole)
         btn_cancel = dialog.addButton("Отмена", QMessageBox.RejectRole)
 
         dialog.exec()
 
         clicked = dialog.clickedButton()
-        if clicked == btn_reset_zero:
-            self.admin_reset_zero()
-        elif clicked == btn_set_coeff:
-            self.admin_set_counts_per_kg()
-        elif clicked == btn_exit:
+        if clicked == btn_exit:
             self.close_app()
 
-
-    def admin_reset_zero(self):
-        """Сбрасывает ноль - устанавливает текущее значение как zero_offset."""
-        if self.last_raw_value is None:
-            QMessageBox.warning(self, "Ошибка", "Нет данных от тензодатчика")
-            return
-
-        reply = QMessageBox.question(
-            self,
-            "Сброс нуля",
-            f"Установить текущее значение {self.last_raw_value} как ноль?",
-            QMessageBox.Yes | QMessageBox.No
-        )
-
-        if reply == QMessageBox.Yes:
-            self.zero_offset = self.last_raw_value
-            self.save_calibration()
-            self.process_loadcell_raw(self.last_raw_value)  # Пересчитать вес
-            QMessageBox.information(self, "Готово", f"Ноль сброшен: {self.zero_offset}")
-            logger.info(f"🎯 Ноль сброшен: {self.zero_offset}")
-
-    def admin_set_counts_per_kg(self):
-        """Устанавливает коэффициент пересчета counts_per_kg."""
-        coeff_str, ok = QInputDialog.getText(
-            self,
-            "Коэффициент пересчета",
-            f"Введите counts_per_kg (текущий: {self.counts_per_kg:.0f}):"
-        )
-
-        if not ok:
-            return
-
-        try:
-            coeff = float(coeff_str.replace(',', '.'))
-        except ValueError:
-            QMessageBox.warning(self, "Ошибка", "Неверный формат числа")
-            return
-
-        if coeff == 0:
-            QMessageBox.warning(self, "Ошибка", "Коэффициент не может быть равен нулю")
-            return
-
-        self.counts_per_kg = coeff
-        self.save_calibration()
-        
-        if self.last_raw_value is not None:
-            self.process_loadcell_raw(self.last_raw_value)  # Пересчитать вес
-        
-        QMessageBox.information(self, "Готово", f"Коэффициент установлен: {coeff:.0f} counts/kg")
-        logger.info(f"📐 Коэффициент установлен: {coeff:.0f} counts/kg")
 
     def close_app(self):
         """Закрывает приложение и освобождает ресурсы."""
@@ -543,6 +483,8 @@ class TerminalUI(QWidget):
             self.heartbeat_timer.stop()
         if self.ser:
             self.ser.close()
+        if self.weight_ser:
+            self.weight_ser.close()
         QApplication.quit()
 
 
@@ -555,9 +497,10 @@ class TerminalUI(QWidget):
 
         tag_name = self.current_bin_name if self.current_bin_name else "бункер"
         timestamp = datetime.now().isoformat()
+        weight_for_record = int(self.current_weight * 1000)
         record = {
             "tag": tag_name,
-            "weight": self.current_weight,
+            "weight": weight_for_record,
             "timestamp": timestamp
         }
 
