@@ -522,20 +522,39 @@ class TerminalUI(QWidget):
             logger.debug(f"📤 Отправка отменена: нет записей")
             return
 
-        payload = {
-            "action": "send",
-            "device_id": DEVICE_ID,
-            "sent_at": datetime.now().isoformat(),
-            "records": self.records
-        }
+        # Отправляем все накопленные записи на /mzo_weight
+        mzo_url = REMOTE_SERVER_API.replace('/data', '/mzo_weight')
         
-        def on_success():
-            logger.info(f"📤 Отправлено на сервер: {len(self.records)} записей")
-            QMessageBox.information(self, "Успех", f"Отправлено {len(self.records)} записей")
-            self.records.clear()
-            self.list_widget.clear()
-        
-        self.transmit(payload, success_callback=on_success)
+        try:
+            response = requests.post(
+                mzo_url,
+                json={
+                    "device_id": DEVICE_ID,
+                    "sent_at": datetime.now().isoformat(),
+                    "records": self.records
+                },
+                timeout=10
+            )
+            
+            if response.status_code in (200, 201):
+                logger.info(f"📤 Отправлено на /mzo_weight: {len(self.records)} записей")
+                QMessageBox.information(self, "Успех", f"Отправлено {len(self.records)} записей")
+                self.records.clear()
+                self.list_widget.clear()
+                self.last_fix_weight = 0.0
+                self.update_weight_display()
+            else:
+                logger.error(f"❌ Ошибка отправки: статус {response.status_code}, ответ: {response.text}")
+                QMessageBox.critical(self, "Ошибка", f"Сервер вернул ошибку: {response.status_code}")
+        except requests.exceptions.ConnectionError:
+            logger.error(f"❌ Не удалось подключиться к {mzo_url}")
+            QMessageBox.critical(self, "Ошибка", "Не удалось подключиться к серверу")
+        except requests.exceptions.Timeout:
+            logger.error(f"❌ Таймаут отправки на {mzo_url}")
+            QMessageBox.critical(self, "Ошибка", "Таймаут подключения к серверу")
+        except Exception as e:
+            logger.error(f"❌ Ошибка отправки: {e}")
+            QMessageBox.critical(self, "Ошибка", f"Ошибка: {e}")
 
     def reset_records(self):
         payload = {
