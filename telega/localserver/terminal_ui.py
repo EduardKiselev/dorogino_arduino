@@ -41,8 +41,7 @@ logger = logging.getLogger(__name__)
 
 
 REMOTE_SERVER_API = os.getenv('REMOTE_SERVER_API', 'http://server:8080/api/records')
-SERIAL_PORT = '/dev/ttyUSB1'       # RFID (PN532)
-WEIGHT_SERIAL_PORT = '/dev/ttyUSB0' # Весовой контроллер
+USB_PORTS = ['/dev/ttyUSB0', '/dev/ttyUSB1']  # Порты для автоопределения
 BAUDRATE = 115200
 HEARTBEAT_INTERVAL = 60   # секунды
 
@@ -73,8 +72,7 @@ class TerminalUI(QWidget):
         self.admin_password_hash = self.load_admin_password()
 
         self.init_ui()
-        self.init_serial()
-        self.init_weight_serial()
+        self.detect_and_init_serials()
         self.init_heartbeat()
 
     def init_heartbeat(self):
@@ -202,7 +200,7 @@ class TerminalUI(QWidget):
 
         # Список зафиксированных записей
         self.list_widget = QListWidget()
-        self.list_widget.setStyleSheet("font-size: 18px; background-color: #313244;")
+        self.list_widget.setStyleSheet("font-size: 54px; background-color: #313244;")
         main_layout.addWidget(self.list_widget)
 
         # Кнопки
@@ -236,40 +234,91 @@ class TerminalUI(QWidget):
         self.update_fix_button()
 
     # ---------- SERIAL ----------
-    def init_serial(self):
-        try:
-            self.ser = serial.Serial(SERIAL_PORT, BAUDRATE, timeout=0.1)
-            logger.info(f"✅ Serial порт открыт: {SERIAL_PORT}")
-        except Exception as e:
-            logger.error(f"❌ Ошибка порта: {e}")
-            self.ser = None
-
-        # Буфер для сбора данных из serial
+    def detect_and_init_serials(self):
+        """Автоопределение портов: весовой контроллер и RFID по формату данных."""
+        self.ser = None
+        self.weight_ser = None
         self.serial_buffer = ""
-
-        # Таймер опроса serial порта
-        self.timer = QTimer()
-        self.timer.timeout.connect(self.read_serial)
-        self.timer.start(100)
-
-        # Таймер проверки устаревания RFID-сигнала (каждые 200 мс)
-        self.position_timer = QTimer()
-        self.position_timer.timeout.connect(self.check_position_timeout)
-        self.position_timer.start(200)
-
-    def init_weight_serial(self):
-        """Инициализирует весовой порт (USB0)."""
-        try:
-            self.weight_ser = serial.Serial(WEIGHT_SERIAL_PORT, BAUDRATE, timeout=0.1)
-            logger.info(f"✅ Весовой порт открыт: {WEIGHT_SERIAL_PORT}")
-        except Exception as e:
-            logger.error(f"❌ Ошибка весового порта: {e}")
-            self.weight_ser = None
-
-        # Таймер опроса весового порта
-        self.weight_timer = QTimer()
-        self.weight_timer.timeout.connect(self.read_weight_serial)
-        self.weight_timer.start(100)
+        self.weight_buf = ""
+        
+        # Открываем оба порта
+        ports_data = {}
+        for port in USB_PORTS:
+            try:
+                ser = serial.Serial(port, BAUDRATE, timeout=2)
+                ports_data[port] = {'serial': ser, 'data': ''}
+                logger.info(f"✅ Порт {port} открыт")
+            except Exception as e:
+                logger.warning(f"⚠️ Не удалось открыть {port}: {e}")
+        
+        if len(ports_data) < 2:
+            logger.error("❌ Нужно минимум 2 порта для автоопределения")
+            return
+        
+        # Читаем первые данные от каждого порта (максимум 5 секунд)
+        logger.info("🔍 Автоопределение портов...")
+        start_time = time.time()
+        detected = {'weight': None, 'rfid': None}
+        
+        while time.time() - start_time < 5:
+            for port, data in ports_data.items():
+                if data['serial'].in_waiting:
+                    chunk = data['serial'].read(data['serial'].in_waiting).decode('utf-8', errors='ignore')
+                    data['data'] += chunk
+                    
+                    # Определяем формат
+                    if '#' in data['data'] and not detected['weight']:
+                        # Весовой контроллер: +XXXXX.X#+YYYYY.YD
+                        detected['weight'] = port
+                        logger.info(f"⚖️ Весовой контроллер определён: {port}")
+                    
+                    if '{"type"' in data['data'] and not detected['rfid']:
+                        # RFID: JSON с type
+                        detected['rfid'] = port
+                        logger.info(f"🏷️ RFID определён: {port}")
+                    
+                    # Если оба определены — выходим
+                    if detected['weight'] and detected['rfid']:
+                        break
+            
+            if detected['weight'] and detected['rfid']:
+                break
+            
+            time.sleep(0.1)
+        
+        # Назначаем порты
+        if detected['weight']:
+            self.weight_ser = ports_data[detected['weight']]['serial']
+            logger.info(f"✅ Весовой порт назначен: {detected['weight']}")
+        else:
+            logger.error("❌ Весовой контроллер не определён")
+        
+        if detected['rfid']:
+            self.ser = ports_data[detected['rfid']]['serial']
+            logger.info(f"✅ RFID порт назначен: {detected['rfid']}")
+        else:
+            logger.error("❌ RFID не определён")
+        
+        # Закрываем неиспользуемые порты
+        for port, data in ports_data.items():
+            if port != detected['weight'] and port != detected['rfid']:
+                data['serial'].close()
+                logger.debug(f"🔒 Неиспользуемый порт {port} закрыт")
+        
+        # Запускаем таймеры
+        if self.ser:
+            self.timer = QTimer()
+            self.timer.timeout.connect(self.read_serial)
+            self.timer.start(100)
+            
+            self.position_timer = QTimer()
+            self.position_timer.timeout.connect(self.check_position_timeout)
+            self.position_timer.start(200)
+        
+        if self.weight_ser:
+            self.weight_timer = QTimer()
+            self.weight_timer.timeout.connect(self.read_weight_serial)
+            self.weight_timer.start(100)
 
     def read_weight_serial(self):
         """Читает и обрабатывает данные с весового порта (USB0)."""
@@ -538,7 +587,35 @@ class TerminalUI(QWidget):
             
             if response.status_code in (200, 201):
                 logger.info(f"📤 Отправлено на /mzo_weight: {len(self.records)} записей")
-                QMessageBox.information(self, "Успех", f"Отправлено {len(self.records)} записей")
+                
+                msg = QMessageBox(self)
+                msg.setWindowTitle("Успех")
+                msg.setText(f"Отправлено {len(self.records)} записей")
+                msg.setStyleSheet("""
+                    QMessageBox {
+                        background-color: #313244;
+                        color: #ffffff;
+                    }
+                    QMessageBox QLabel {
+                        color: #ffffff;
+                        font-size: 24px;
+                        min-width: 400px;
+                        padding: 20px;
+                    }
+                    QPushButton {
+                        font-size: 20px;
+                        padding: 15px 40px;
+                        background-color: #45475a;
+                        color: white;
+                        border-radius: 10px;
+                        margin: 10px;
+                    }
+                    QPushButton:hover {
+                        background-color: #585b70;
+                    }
+                """)
+                msg.exec()
+                
                 self.records.clear()
                 self.list_widget.clear()
                 self.last_fix_weight = 0.0
